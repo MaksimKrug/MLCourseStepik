@@ -99,10 +99,10 @@ class MyLineReg:
     def fit(self, X: pd.DataFrame, y: pd.Series, verbose: Union[bool, int] = False):
         # fix random_seed
         self._fix_random_seed()
-        # insert
+        # insert bias column
         X = self._add_bias_column(X)
         # create weights
-        self.weights = np.array([1] * X.shape[1])
+        self.weights = np.ones(X.shape[1])
         # get initial mse
         mse_error = self._get_mse(y, X @ self.weights)
         # gradient descent
