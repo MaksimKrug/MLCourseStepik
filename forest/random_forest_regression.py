@@ -1,6 +1,9 @@
+import random
+from typing import Optional
+from collections import defaultdict
+
 import numpy as np
 import pandas as pd
-from typing import Optional
 
 
 class Node:
@@ -43,6 +46,7 @@ class MyTreeReg:
         max_leafs: int = 20,
         bins: Optional[int] = None,
         criterion: str = "mse",
+        examples_num: int = 0,
     ):
         self.max_depth = max_depth
         self.min_samples_split = min_samples_split
@@ -51,7 +55,7 @@ class MyTreeReg:
         self.criterion = criterion
 
         self.leafs_cnt = 0
-        self.examples_num = 1
+        self.examples_num = examples_num
         self.required_leafs = 0
         self.tree = {}
         self.delimeters = {}
@@ -245,7 +249,7 @@ class MyTreeReg:
             right = node.right
             local_fi = (
                 node.elements
-                / self.tree.elements
+                / self.examples_num
                 * (
                     node.criterion_val
                     - left.elements / node.elements * left.criterion_val
@@ -285,43 +289,108 @@ class MyTreeReg:
             self.print_tree(node.right, depth + 1)
 
 
-tests = (
-    (2, (1, 1, 2)),
-    (5, (3, 2, 5)),
-    (7, (5, 100, 10)),
-)
-from sklearn.datasets import make_classification, make_regression, load_diabetes
+class MyForestReg:
+    def __init__(
+        self,
+        n_estimators: int = 10,
+        max_features: float = 0.5,
+        max_samples: float = 0.5,
+        oob_score: Optional[str] = None,
+        random_state: int = 42,
+        max_depth: int = 5,
+        min_samples_split: int = 2,
+        max_leafs: int = 20,
+        bins: int = 16,
+    ):
+        # forest
+        self.n_estimators = n_estimators
+        self.max_features = max_features
+        self.max_samples = max_samples
+        self.oob_score = oob_score
+        # tree
+        self.max_depth = max_depth
+        self.min_samples_split = min_samples_split
+        self.max_leafs = max_leafs
+        self.bins = bins
+        # random state
+        self.random_state = random_state
+        # extra
+        self.leafs_cnt = 0
+        self.fi = {}
+        self.oob_score_ = 0
 
+    def __repr__(self):
+        return f"{self.__class__.__name__} class: " + ", ".join(
+            [f"{k}={v}" for k, v in self.__dict__.items()]
+        )
 
-X = load_diabetes(as_frame=True)["data"]
-y = load_diabetes(as_frame=True)["target"]
+    def _get_oob_score(self, X, y, oob_preds: dict):
+        # average preds
+        oob_preds = {k: np.mean(v) for k, v in oob_preds.items()}
+        y = y[list(oob_preds.keys())]
+        y_hat = [oob_preds.get(i, 0) for i in y.index]
+        if self.oob_score is None:
+            return None
+        elif self.oob_score == "mae":
+            metric_val = np.mean(np.abs(y - y_hat))
+        elif self.oob_score == "mse":
+            metric_val = np.mean((y - y_hat) ** 2)
+        elif self.oob_score == "rmse":
+            metric_val = np.mean((y - y_hat) ** 2)
+            metric_val = np.sqrt(metric_val)
+        elif self.oob_score == "mape":
+            metric_val = 100 * np.mean(np.abs((y - y_hat) / y))
+        elif self.oob_score == "r2":
+            metric_val = 1 - np.sum((y - y_hat) ** 2) / np.sum((y - y.mean()) ** 2)
 
-for test_num, (ans, test) in enumerate(tests):
-    obj = MyTreeReg(*test)
-    obj.fit(X, y)
-    if ans != obj.leafs_cnt or 1:
-        print(test)
-        print(ans, obj.leafs_cnt)
-        # obj.print_tree(obj.tree)
+        self.oob_score_ = metric_val
 
+    def fit(self, X: pd.DataFrame, y: pd.Series):
+        random.seed(self.random_state)
+        # teach trees
+        self.trees = []
+        oob_preds = defaultdict(list)
+        for _ in range(self.n_estimators):
+            # get sample
+            cols_idx = random.sample(
+                list(X.columns), round(len(X.columns) * self.max_features)
+            )
+            rows_idx = random.sample(range(len(X)), round(len(X) * self.max_samples))
+            X_train = X.loc[rows_idx, cols_idx].copy()
+            y_train = y[rows_idx].copy()
+            X_test = X.loc[~X.index.isin(rows_idx), cols_idx].copy()
+            # create tree
+            tree = MyTreeReg(
+                self.max_depth,
+                self.min_samples_split,
+                self.max_leafs,
+                self.bins,
+                examples_num=len(X),
+            )
+            tree.fit(X_train, y_train)
+            self.trees.append(tree)
+            self.leafs_cnt += tree.leafs_cnt
+            # oob preds
+            preds = tree.predict(X_test)
+            for idx, pred in zip(X_test.index, preds):
+                oob_preds[idx].append(pred)
+        # get oob_score_
+        self._get_oob_score(X, y, oob_preds)
 
-# X, y = make_classification(
-#     n_samples=150, n_features=5, n_informative=3, random_state=42
-# )
-# X = pd.DataFrame(X).round(2)
-# y = pd.Series(y)
-# X.columns = [f"col_{col}" for col in X.columns]
+        # update fi
+        for col in X.columns:
+            self.fi[col] = 0
+        for tree in self.trees:
+            for col in X.columns:
+                self.fi[col] += tree.fi.get(col, 0)
 
-# df = load_diabetes
-
-# # print("-"*40)
-# # obj = MyTreeClf(2,2,2,10,"gini")
-# # obj.fit(X, y)
-# # obj.print_tree(obj.tree)
-# # print(obj.fi)
-
-# print("-"*40)
-# obj = MyTreeClf(5,2,10,10,"gini")
-# obj.fit(X, y)
-# obj.print_tree(obj.tree)
-# print(obj.fi)
+    def predict(self, X: pd.DataFrame):
+        # collect preds
+        preds = []
+        for tree in self.trees:
+            pred = tree.predict(X)
+            preds.append(pred)
+        # get average
+        preds = np.array(preds)
+        preds = np.mean(preds, axis=0)
+        return preds
