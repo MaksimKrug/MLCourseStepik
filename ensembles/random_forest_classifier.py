@@ -177,7 +177,6 @@ class MyTreeClf:
             if left_best_split[2] == 0 or len(X_left) < self.min_samples_split:
                 self._add_leaf(node, y_left, "left")
             else:
-
                 node.left = Node(
                     left_best_split[0],
                     left_best_split[1],

@@ -1,6 +1,9 @@
+import random
+from typing import Optional
+from collections import defaultdict
+
 import numpy as np
 import pandas as pd
-from typing import Optional
 
 
 class Node:
@@ -25,24 +28,25 @@ class Leaf:
     def __init__(
         self,
         name: str = "leaf_left",
-        prob_1: float = 0,
+        pred: float = 0,
         criterion_val: float = 0,
         elements: int = 0,
     ):
         self.name = name
-        self.prob_1 = prob_1
+        self.pred = pred
         self.criterion_val = criterion_val
         self.elements = elements
 
 
-class MyTreeClf:
+class MyTreeReg:
     def __init__(
         self,
         max_depth: int = 5,
         min_samples_split: int = 2,
         max_leafs: int = 20,
         bins: Optional[int] = None,
-        criterion: str = "entropy",
+        criterion: str = "mse",
+        examples_num: int = 0,
     ):
         self.max_depth = max_depth
         self.min_samples_split = min_samples_split
@@ -51,7 +55,7 @@ class MyTreeClf:
         self.criterion = criterion
 
         self.leafs_cnt = 0
-        self.examples_num = 1
+        self.examples_num = examples_num
         self.required_leafs = 0
         self.tree = {}
         self.delimeters = {}
@@ -62,31 +66,20 @@ class MyTreeClf:
             [f"{k}={v}" for k, v in self.__dict__.items()]
         )
 
-    def _calculate_criterion(self, vals: np.ndarray):
-        if self.criterion == "entropy":
-            # calculate entropy
-            unique_classes, class_counts = np.unique(vals, return_counts=True)
-            class_counts = class_counts / len(vals)
-            if len(unique_classes) == 1:
-                return 0
-            criterion_val = -np.sum(class_counts * np.log2(class_counts))
-        elif self.criterion == "gini":
-            # calculate gini
-            _, class_counts = np.unique(vals, return_counts=True)
-            class_counts = class_counts / len(vals)
-            criterion_val = 1 - np.sum(class_counts**2)
-
-        return criterion_val
+    def _calculate_criterion(self, y: np.ndarray):
+        if len(y) == 0:
+            return 0
+        return np.mean((y - y.mean()) ** 2)
 
     def _calculate_information_gain(
         self, vals: np.ndarray, left: np.ndarray, right: np.ndarray
     ):
-        # calculate entropies
+        # calculate information criterions
         s_0 = self._calculate_criterion(vals[:, 1])
         s_1 = self._calculate_criterion(left[:, 1])
         s_2 = self._calculate_criterion(right[:, 1])
 
-        # calculate inofrmation gane
+        # calculate inofrmation gain
         ig = s_0 - len(left) / len(vals) * s_1 - len(right) / len(vals) * s_2
 
         return ig
@@ -122,15 +115,14 @@ class MyTreeClf:
         return (left_X, left_y), (right_X, right_y)
 
     def _add_leaf(self, node: Node, y: pd.Series, direction: str):
-        counts = y.value_counts(normalize=True).to_dict()
         criterion_val = self._calculate_criterion(y.values)
 
         if direction == "left":
-            node.left = Leaf("leaf_left", counts.get(1, 0), criterion_val, len(y))
+            node.left = Leaf("leaf_left", y.mean(), criterion_val, len(y))
             self.leafs_cnt += 1
             self.required_leafs -= 1
         elif direction == "right":
-            node.right = Leaf("leaf_right", counts.get(1, 0), criterion_val, len(y))
+            node.right = Leaf("leaf_right", y.mean(), criterion_val, len(y))
             self.leafs_cnt += 1
             self.required_leafs -= 1
 
@@ -218,7 +210,7 @@ class MyTreeClf:
             vals = vals[sorted_indices]
             # get delimeters
             _, delimeters = np.unique(vals, return_index=True)
-            if self.bins is None or len(delimeters) <= self.bins:
+            if self.bins is None or len(delimeters) <= self.bins - 1:
                 delimeters = [
                     (vals[delimeter] + vals[delimeter + 1]) / 2
                     for delimeter in delimeters[:-1]
@@ -256,7 +248,7 @@ class MyTreeClf:
             right = node.right
             local_fi = (
                 node.elements
-                / self.tree.elements
+                / self.examples_num
                 * (
                     node.criterion_val
                     - left.elements / node.elements * left.criterion_val
@@ -274,20 +266,13 @@ class MyTreeClf:
                 node = node.right
             else:
                 node = node.left
-        return node.prob_1
+        return node.pred
 
     def predict(self, X: pd.DataFrame):
         preds = []
         for _, d in X.iterrows():
-            prob = self._tree_traversal(d.copy())
-            preds.append(prob > 0.5)
-        return preds
-
-    def predict_proba(self, X: pd.DataFrame):
-        preds = []
-        for _, d in X.iterrows():
-            prob = self._tree_traversal(d.copy())
-            preds.append(prob)
+            pred = self._tree_traversal(d.copy())
+            preds.append(pred)
         return preds
 
     def print_tree(self, node, depth=0):
@@ -295,9 +280,116 @@ class MyTreeClf:
             print(f"leafs_cnt: {self.leafs_cnt}")
         if isinstance(node, Leaf):
             print("  " * depth, end="")
-            print(node.name, "-", node.prob_1, node.elements)
+            print(node.name, "-", node.pred)
         elif isinstance(node, Node):
             print("  " * depth, end="")
-            print(node.col, ">", node.val, node.elements)
+            print(node.col, ">", node.val)
             self.print_tree(node.left, depth + 1)
             self.print_tree(node.right, depth + 1)
+
+
+class MyForestReg:
+    def __init__(
+        self,
+        n_estimators: int = 10,
+        max_features: float = 0.5,
+        max_samples: float = 0.5,
+        oob_score: Optional[str] = None,
+        random_state: int = 42,
+        max_depth: int = 5,
+        min_samples_split: int = 2,
+        max_leafs: int = 20,
+        bins: int = 16,
+    ):
+        # forest
+        self.n_estimators = n_estimators
+        self.max_features = max_features
+        self.max_samples = max_samples
+        self.oob_score = oob_score
+        # tree
+        self.max_depth = max_depth
+        self.min_samples_split = min_samples_split
+        self.max_leafs = max_leafs
+        self.bins = bins
+        # random state
+        self.random_state = random_state
+        # extra
+        self.leafs_cnt = 0
+        self.fi = {}
+        self.oob_score_ = 0
+
+    def __repr__(self):
+        return f"{self.__class__.__name__} class: " + ", ".join(
+            [f"{k}={v}" for k, v in self.__dict__.items()]
+        )
+
+    def _get_oob_score(self, X, y, oob_preds: dict):
+        # average preds
+        oob_preds = {k: np.mean(v) for k, v in oob_preds.items()}
+        y = y[list(oob_preds.keys())]
+        y_hat = [oob_preds.get(i, 0) for i in y.index]
+        if self.oob_score is None:
+            return None
+        elif self.oob_score == "mae":
+            metric_val = np.mean(np.abs(y - y_hat))
+        elif self.oob_score == "mse":
+            metric_val = np.mean((y - y_hat) ** 2)
+        elif self.oob_score == "rmse":
+            metric_val = np.mean((y - y_hat) ** 2)
+            metric_val = np.sqrt(metric_val)
+        elif self.oob_score == "mape":
+            metric_val = 100 * np.mean(np.abs((y - y_hat) / y))
+        elif self.oob_score == "r2":
+            metric_val = 1 - np.sum((y - y_hat) ** 2) / np.sum((y - y.mean()) ** 2)
+
+        self.oob_score_ = metric_val
+
+    def fit(self, X: pd.DataFrame, y: pd.Series):
+        random.seed(self.random_state)
+        # teach trees
+        self.trees = []
+        oob_preds = defaultdict(list)
+        for _ in range(self.n_estimators):
+            # get sample
+            cols_idx = random.sample(
+                list(X.columns), round(len(X.columns) * self.max_features)
+            )
+            rows_idx = random.sample(range(len(X)), round(len(X) * self.max_samples))
+            X_train = X.loc[rows_idx, cols_idx].copy()
+            y_train = y[rows_idx].copy()
+            X_test = X.loc[~X.index.isin(rows_idx), cols_idx].copy()
+            # create tree
+            tree = MyTreeReg(
+                self.max_depth,
+                self.min_samples_split,
+                self.max_leafs,
+                self.bins,
+                examples_num=len(X),
+            )
+            tree.fit(X_train, y_train)
+            self.trees.append(tree)
+            self.leafs_cnt += tree.leafs_cnt
+            # oob preds
+            preds = tree.predict(X_test)
+            for idx, pred in zip(X_test.index, preds):
+                oob_preds[idx].append(pred)
+        # get oob_score_
+        self._get_oob_score(X, y, oob_preds)
+
+        # update fi
+        for col in X.columns:
+            self.fi[col] = 0
+        for tree in self.trees:
+            for col in X.columns:
+                self.fi[col] += tree.fi.get(col, 0)
+
+    def predict(self, X: pd.DataFrame):
+        # collect preds
+        preds = []
+        for tree in self.trees:
+            pred = tree.predict(X)
+            preds.append(pred)
+        # get average
+        preds = np.array(preds)
+        preds = np.mean(preds, axis=0)
+        return preds

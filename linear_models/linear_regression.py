@@ -8,7 +8,7 @@ import math
 class MyLineReg:
     def __init__(
         self,
-        n_iter: int = 10,
+        n_iter: int = 100,
         learning_rate: Union[Callable[[float], float], float] = 0.1,
         weights: np.ndarray = [],
         metric: Optional[str] = None,

@@ -1,9 +1,143 @@
-import random
-from typing import Optional
-from collections import defaultdict
-
 import numpy as np
 import pandas as pd
+from copy import deepcopy
+from typing import Union, Optional, Callable
+from collections import defaultdict
+
+import random
+
+
+class MyLineReg:
+    def __init__(
+        self,
+        n_iter: int = 100,
+        learning_rate: Union[Callable[[float], float], float] = 0.1,
+        weights: np.ndarray = [],
+        metric: Optional[str] = None,
+        reg: Optional[str] = None,
+        l1_coef: float = 0.0,
+        l2_coef: float = 0.0,
+        sgd_sample: Optional[Union[float, int]] = None,
+        random_state: int = 42,
+    ):
+        self.n_iter = n_iter
+        self.learning_rate = learning_rate
+        self.weights = weights
+        self.metric = metric
+        self.reg = reg
+        self.l1_coef = l1_coef
+        self.l2_coef = l2_coef
+        self.sgd_sample = sgd_sample
+        self.random_state = random_state
+
+    def __repr__(self):
+        return f"MyLineReg class: " + ", ".join(
+            [f"{k}={v}" for k, v in self.__dict__.items()]
+        )
+
+    def get_coef(self):
+        return np.array(self.weights[1:])
+
+    def get_best_score(self):
+        return self.final_metric
+
+    def _get_mse(self, y: pd.Series, y_hat: pd.Series):
+        # calculate MSE
+        mse_error = np.mean((y - y_hat) ** 2)
+        if self.reg == "l1":
+            mse_error = mse_error + self.l1_coef * np.sum(np.abs(self.weights))
+        elif self.reg == "l2":
+            mse_error = mse_error + self.l2_coef * np.sum((self.weights) ** 2)
+        elif self.reg == "elasticnet":
+            mse_error = mse_error + self.l1_coef * np.sum(np.abs(self.weights))
+            mse_error = mse_error + self.l2_coef * np.sum((self.weights) ** 2)
+
+        return mse_error
+
+    def _calculate_gradient(self, X: pd.DataFrame, y: pd.Series):
+        def _sgn(weights: np.ndarray):
+            return np.array([-1 if w < 0 else 1 if w > 0 else 0 for w in weights])
+
+        # calculate gradient
+        y_hat = X @ self.weights
+        gradients = 2 / len(X) * (y_hat - y) @ X
+        if self.reg == "l1":
+            gradients = gradients + self.l1_coef * _sgn(self.weights)
+        elif self.reg == "l2":
+            gradients = gradients + self.l2_coef * 2 * self.weights
+        elif self.reg == "elasticnet":
+            gradients = gradients + self.l1_coef * _sgn(self.weights)
+            gradients = gradients + self.l2_coef * 2 * self.weights
+
+        return gradients
+
+    def _get_metric(self, X: pd.DataFrame, y: pd.Series):
+        # return metric
+        y_hat = X @ self.weights
+        if self.metric is None:
+            metric_val = None
+        elif self.metric == "mae":
+            metric_val = np.mean(np.abs(y - y_hat))
+        elif self.metric == "mse":
+            metric_val = np.mean((y - y_hat) ** 2)
+        elif self.metric == "rmse":
+            metric_val = np.mean((y - y_hat) ** 2)
+            metric_val = np.sqrt(metric_val)
+        elif self.metric == "mape":
+            metric_val = 100 * np.mean(np.abs((y - y_hat) / y))
+        elif self.metric == "r2":
+            metric_val = 1 - np.sum((y - y_hat) ** 2) / np.sum((y - y.mean()) ** 2)
+
+        return metric_val
+
+    def fit(self, X: pd.DataFrame, y: pd.Series, verbose: Union[bool, int] = False):
+        # fix random_seed
+        random.seed(self.random_state)
+        # insert bias column
+        X.insert(0, "bias", 1)
+        # create weights
+        self.weights = np.ones(X.shape[1])
+        # get initial mse
+        mse_error = self._get_mse(y, X @ self.weights)
+        # gradient descent
+        for iter_num in range(1, self.n_iter + 1):
+            # get minibatch
+            if self.sgd_sample is None:
+                x_batch, y_batch = X, y
+            else:
+                if isinstance(self.sgd_sample, int):
+                    sample_rows_idx = random.sample(range(X.shape[0]), self.sgd_sample)
+                elif isinstance(self.sgd_sample, float):
+                    sample_rows_idx = random.sample(
+                        range(X.shape[0]), round(self.sgd_sample * X.shape[0])
+                    )
+                x_batch, y_batch = X.iloc[sample_rows_idx], y.iloc[sample_rows_idx]
+
+            mse_error = self._get_mse(y_batch, x_batch @ self.weights)
+            gradients = self._calculate_gradient(x_batch, y_batch)
+            if callable(self.learning_rate):
+                self.weights = self.weights - self.learning_rate(iter_num) * gradients
+            else:
+                self.weights = self.weights - self.learning_rate * gradients
+            if verbose:
+                if iter_num == 0:
+                    metric_val = self._get_metric(x_batch, y_batch)
+                    print(
+                        f"start | loss: {round(mse_error, 3)} | {self.metric} : {metric_val}"
+                    )
+                elif iter_num % verbose == 0:
+                    metric_val = self._get_metric(x_batch, y_batch)
+                    print(
+                        f"{iter_num} | loss: {round(mse_error, 3)} | {self.metric} : {metric_val}"
+                    )
+
+        # get final metric
+        self.final_metric = self._get_metric(X, y)
+
+    def predict(self, X: pd.DataFrame):
+        # get predict
+        X.insert(0, "bias", 1)
+        return X @ self.weights
 
 
 class Node:
@@ -166,7 +300,6 @@ class MyTreeReg:
             if left_best_split[2] == 0 or len(X_left) < self.min_samples_split:
                 self._add_leaf(node, y_left, "left")
             else:
-
                 node.left = Node(
                     left_best_split[0],
                     left_best_split[1],
@@ -289,34 +422,101 @@ class MyTreeReg:
             self.print_tree(node.right, depth + 1)
 
 
-class MyForestReg:
+class MyKNNReg:
+    def __init__(self, k: int = 3, metric: str = "euclidean", weight: str = "uniform"):
+        self.k = k
+        self.train_size = (0, 0)
+        self.metric = metric
+        self.weight = weight
+
+    def __repr__(self):
+        return f"{self.__class__.__name__} class: " + ", ".join(
+            [f"{k}={v}" for k, v in self.__dict__.items()]
+        )
+
+    def _weighted_pred(self, dist: np.ndarray):
+        # sort by distances
+        groups = sorted(zip(self.y, dist), key=lambda x: x[1])
+        groups = groups[: self.k]
+
+        if self.weight == "rank":
+            denominator = sum(1 / i for i in range(1, len(groups) + 1))
+            weights = np.array(
+                [(1 / idx) / denominator for idx in range(1, len(groups) + 1)]
+            )
+        elif self.weight == "distance":
+            denominator = sum(1 / d[1] for d in groups)
+            weights = np.array([(1 / d[1]) / denominator for d in groups])
+
+        return np.sum([groups[idx][0] * weights[idx] for idx in range(len(groups))])
+
+    def _get_distance(self, X_pred: pd.DataFrame):
+        x_values, pred_values = self.X.values, X_pred.values
+        if self.metric == "euclidean":
+            dist = (pred_values[:, np.newaxis, :] - x_values[np.newaxis, :, :]) ** 2
+            dist = np.sum(dist, axis=2)
+            dist = np.sqrt(dist)
+        elif self.metric == "chebyshev":
+            dist = np.abs(pred_values[:, np.newaxis, :] - x_values[np.newaxis, :, :])
+            dist = dist.max(axis=2)
+        elif self.metric == "manhattan":
+            dist = np.abs(pred_values[:, np.newaxis, :] - x_values[np.newaxis, :, :])
+            dist = np.sum(dist, axis=2)
+        elif self.metric == "cosine":
+            numerator = pred_values[:, np.newaxis, :] * x_values[np.newaxis, :, :]
+            numerator = np.sum(numerator, axis=2)
+            den1 = np.sqrt(np.sum(pred_values**2, axis=1))
+            den2 = np.sqrt(np.sum(x_values**2, axis=1))
+            denominator = np.outer(den1, den2)
+            dist = 1 - (numerator / denominator)
+
+        return dist
+
+    def _custom_mode(self, array: np.ndarray):
+        unique, counts = np.unique(array, return_counts=True)
+        max_count_index = np.argmax(counts)
+        mode_val = unique[max_count_index]
+        if len(counts) == 1:
+            return mode_val
+        elif counts[0] > counts[1]:
+            return 0
+        else:
+            return 1
+
+    def fit(self, X: pd.DataFrame, y: pd.Series):
+        self.X = X
+        self.y = y
+        self.train_size = tuple(X.shape)
+
+    def predict(self, X_pred: pd.DataFrame):
+        # get distances
+        distances = self._get_distance(X_pred)
+        # predicts
+        if self.weight == "uniform":
+            top_indices = np.argsort(distances, axis=1)[..., : self.k]
+            values = self.y.values[top_indices]
+            predicts = np.mean(values, axis=1)
+        elif self.weight in ["rank", "distance"]:
+            predicts = np.apply_along_axis(self._weighted_pred, axis=1, arr=(distances))
+
+        return predicts
+
+
+class MyBaggingReg:
     def __init__(
         self,
+        estimator=None,
         n_estimators: int = 10,
-        max_features: float = 0.5,
-        max_samples: float = 0.5,
-        oob_score: Optional[str] = None,
+        max_samples: float = 1.0,
         random_state: int = 42,
-        max_depth: int = 5,
-        min_samples_split: int = 2,
-        max_leafs: int = 20,
-        bins: int = 16,
+        oob_score: Optional[str] = None,
     ):
-        # forest
+        self.estimator = estimator
         self.n_estimators = n_estimators
-        self.max_features = max_features
         self.max_samples = max_samples
-        self.oob_score = oob_score
-        # tree
-        self.max_depth = max_depth
-        self.min_samples_split = min_samples_split
-        self.max_leafs = max_leafs
-        self.bins = bins
-        # random state
         self.random_state = random_state
-        # extra
-        self.leafs_cnt = 0
-        self.fi = {}
+        self.oob_score = oob_score
+
         self.oob_score_ = 0
 
     def __repr__(self):
@@ -345,51 +545,42 @@ class MyForestReg:
 
         self.oob_score_ = metric_val
 
-    def fit(self, X: pd.DataFrame, y: pd.Series):
+    def fit(self, X: pd.DataFrame, y: pd.DataFrame):
         random.seed(self.random_state)
-        # teach trees
-        self.trees = []
+        self.estimators = []
+        # samples
+        rows_samples = []
         oob_preds = defaultdict(list)
         for _ in range(self.n_estimators):
+            sample_rows_idx = random.choices(
+                list(X.index), k=int(len(X) * self.max_samples)
+            )
+            rows_samples.append(sample_rows_idx)
+
+        for idx in range(self.n_estimators):
             # get sample
-            cols_idx = random.sample(
-                list(X.columns), round(len(X.columns) * self.max_features)
-            )
-            rows_idx = random.sample(range(len(X)), round(len(X) * self.max_samples))
-            X_train = X.loc[rows_idx, cols_idx].copy()
-            y_train = y[rows_idx].copy()
-            X_test = X.loc[~X.index.isin(rows_idx), cols_idx].copy()
-            # create tree
-            tree = MyTreeReg(
-                self.max_depth,
-                self.min_samples_split,
-                self.max_leafs,
-                self.bins,
-                examples_num=len(X),
-            )
-            tree.fit(X_train, y_train)
-            self.trees.append(tree)
-            self.leafs_cnt += tree.leafs_cnt
+
+            X_train, y_train = X.iloc[rows_samples[idx]], y.iloc[rows_samples[idx]]
+            X_test = X.loc[~X.index.isin(rows_samples[idx])].copy()
+
+            # train model
+            model = deepcopy(self.estimator)
+            model.fit(X_train, y_train)
+            self.estimators.append(model)
+
             # oob preds
-            preds = tree.predict(X_test)
+            preds = model.predict(X_test)
             for idx, pred in zip(X_test.index, preds):
                 oob_preds[idx].append(pred)
         # get oob_score_
         self._get_oob_score(X, y, oob_preds)
 
-        # update fi
-        for col in X.columns:
-            self.fi[col] = 0
-        for tree in self.trees:
-            for col in X.columns:
-                self.fi[col] += tree.fi.get(col, 0)
-
     def predict(self, X: pd.DataFrame):
-        # collect preds
         preds = []
-        for tree in self.trees:
-            pred = tree.predict(X)
-            preds.append(pred)
+        for model in self.estimators:
+            model_pred = model.predict(X.copy())
+            preds.append(model_pred)
+
         # get average
         preds = np.array(preds)
         preds = np.mean(preds, axis=0)
