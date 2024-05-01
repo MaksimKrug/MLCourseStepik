@@ -303,6 +303,7 @@ class MyBoostReg:
         max_features: float = 0.5,
         max_samples: float = 0.5,
         random_state: int = 42,
+        reg: float = 0.1,
     ):
         self.n_estimators = n_estimators
         self.learning_rate = learning_rate
@@ -312,6 +313,7 @@ class MyBoostReg:
         self.max_features = max_features
         self.max_samples = max_samples
         self.random_state = random_state
+        self.reg = reg
 
         self.max_depth = max_depth
         self.min_samples_split = min_samples_split
@@ -319,8 +321,9 @@ class MyBoostReg:
         self.bins = bins
 
         self.pred_0 = 0
-        self.best_score = 0
+        self.best_score = 0 if self.metric == "R2" else np.inf
         self.trees = []
+        self.fi = {}
 
     def __repr__(self):
         return f"{self.__class__.__name__} class: " + ", ".join(
@@ -331,9 +334,9 @@ class MyBoostReg:
         if isinstance(node, Leaf):
             residual = y - preds
             if self.loss == "MSE":
-                node.pred = np.mean(residual)
+                node.pred = np.mean(residual) + self.leafs_cnt * self.reg
             elif self.loss == "MAE":
-                node.pred = np.median(residual)
+                node.pred = np.median(residual) + self.leafs_cnt * self.reg
         elif isinstance(node, Node):
             # left
             left_idx = X[node.col] <= node.val
@@ -344,29 +347,58 @@ class MyBoostReg:
             X_right, y_right, preds_right = X[right_idx], y[right_idx], preds[right_idx]
             self._update_leafs(node.right, X_right, y_right, preds_right)
 
-    def _calculate_score(self, y, preds):
-        metric_val = None
-        if self.metric == "MAE":
-            metric_val = np.mean(np.abs(y - preds))
+    def _calculate_scores(self, y_true, y_pred):
+        # loss
+        loss = self._calculate_loss(y_true, y_pred)
+        # metric
+        if self.metric is None:
+            metric_val = loss
+        elif self.metric == "MAE":
+            metric_val = np.mean(np.abs(y_true - y_pred))
         elif self.metric == "MSE":
-            metric_val = np.mean((y - preds) ** 2)
+            metric_val = np.mean((y_pred - y_true) ** 2)
         elif self.metric == "RMSE":
-            metric_val = np.mean((y - preds) ** 2)
+            metric_val = np.mean((y_true - y_pred) ** 2)
             metric_val = np.sqrt(metric_val)
         elif self.metric == "MAPE":
-            metric_val = 100 * np.mean(np.abs((y - preds) / y))
+            metric_val = 100 * np.mean(np.abs((y_true - y_pred) / y))
         elif self.metric == "R2":
-            metric_val = 1 - np.sum((y - preds) ** 2) / np.sum((y - y.mean()) ** 2)
+            metric_val = 1 - np.sum((y_true - y_pred) ** 2) / np.sum(
+                (y_true - y_true.mean()) ** 2
+            )
 
-        return metric_val
+        return loss, metric_val
 
-    def fit(self, X: pd.DataFrame, y: pd.Series, verbose: Optional[int] = None):
+    def _calculate_loss(self, y_true, y_pred):
+        if self.loss == "MSE":
+            loss = np.mean((y_pred - y_true) ** 2)
+        elif self.loss == "MAE":
+            loss = np.mean(np.abs(y_pred - y_true))
+        return loss
+
+    def fit(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        X_eval: Optional[pd.DataFrame] = None,
+        y_eval: Optional[pd.Series] = None,
+        early_stopping: Optional[int] = None,
+        verbose: Optional[int] = None,
+    ):
         random.seed(self.random_state)
+
+        self.leafs_cnt = 0
+        no_improvements = 0
         if self.loss == "MSE":
             self.pred_0 = np.mean(y)
         elif self.loss == "MAE":
             self.pred_0 = np.median(y)
         preds = pd.Series(np.full_like(y, self.pred_0), index=y.index)
+        if early_stopping:
+            pred_eval_0 = np.mean(y_eval) if self.loss == "MSE" else np.median(y_eval)
+            preds_eval = pd.Series(
+                np.full_like(y_eval, pred_eval_0), index=y_eval.index
+            )
 
         for iter_num in range(1, self.n_estimators + 1):
             # sample
@@ -382,9 +414,14 @@ class MyBoostReg:
 
             # gradient
             if self.loss == "MSE":
-                grad = 2 * (preds_sample - y_sample)
+                grad = 2 * (preds - y)
             elif self.loss == "MAE":
-                grad = np.sign(preds_sample - y_sample)
+                grad = np.sign(preds - y)
+
+            loss, score = self._calculate_scores(y, preds)
+            print("AAA", loss, score)
+
+            grad = grad.loc[rows_idx].copy()
 
             # get sample
             model = MyTreeReg(
@@ -392,7 +429,7 @@ class MyBoostReg:
                 self.min_samples_split,
                 self.max_leafs,
                 self.bins,
-                examples_num=len(y_sample),
+                examples_num=len(y),
             )
 
             # fit
@@ -407,21 +444,39 @@ class MyBoostReg:
             else:
                 lr_step = self.learning_rate
             preds += np.asarray(new_preds) * lr_step
+            self.leafs_cnt += model.leafs_cnt
 
             # loss & metrics
-            if self.loss == "MSE":
-                loss = np.mean((preds - y) ** 2)
-            elif self.loss == "MAE":
-                loss = np.mean(np.abs(preds - y))
-            self.best_score = self._calculate_score(y, preds)
-            if self.best_score is None:
-                self.best_score = loss
-            if verbose is not None and iter_num % verbose == 0:
-                print(
-                    f"{iter_num}. Loss[{self.loss}]: {loss} | {self.metric}: {self.best_score}"
-                )
+            if early_stopping:
+                # get scores
+                model_eval_preds = model.predict(X_eval)
+                preds_eval += np.asarray(model_eval_preds) * lr_step
+                loss, score = self._calculate_scores(y_eval, preds_eval)
+                if self.metric == "R2":
+                    no_improvements += score < self.best_score
+                    self.best_score = max(self.best_score, score)
+                else:
+                    no_improvements += score > self.best_score
+                    self.best_score = min(self.best_score, score)
 
-            # break
+                if no_improvements == early_stopping:
+                    self.trees = self.trees[:-early_stopping]
+                    break
+            else:
+                preds_sample = preds.loc[rows_idx].copy()
+                loss, score = self._calculate_scores(y_sample, preds_sample)
+                self.best_score = score
+
+            # verbose
+            if verbose is not None and iter_num % verbose == 0:
+                print(f"{iter_num}. Loss[{self.loss}]: {loss} | {self.metric}: {score}")
+
+        # update fi
+        for col in X.columns:
+            self.fi[col] = 0.0
+        for tree in self.trees:
+            for col in X.columns:
+                self.fi[col] += tree.fi.get(col, 0)
 
     def predict(self, X: pd.DataFrame):
         preds = []
@@ -443,11 +498,15 @@ class MyBoostReg:
 from sklearn.datasets import make_regression
 
 X, y = make_regression(
-    n_samples=1000, n_features=14, n_informative=10, noise=15, random_state=42
+    n_samples=1500, n_features=14, n_informative=10, noise=15, random_state=42
 )
 X = pd.DataFrame(X)
 y = pd.Series(y)
 X.columns = [f"col_{col}" for col in X.columns]
+X_train, X_eval = X.iloc[:1200], X.iloc[1200:]
+y_train, y_eval = y.iloc[:1200], y.iloc[1200:]
 
-obj = MyBoostReg(loss="MSE", metric="R2")
-obj.fit(X, y, 1)
+obj = MyBoostReg(
+    loss="MSE", metric="RMSE", max_features=0.3, max_samples=0.3, learning_rate=1.6
+)
+obj.fit(X_train, y_train, X_eval, y_eval, 3, verbose=1)
