@@ -2,9 +2,8 @@ import numpy as np
 import pandas as pd
 from copy import deepcopy
 from typing import Union, Optional, Callable
-from collections import defaultdict
-
 import random
+from collections import defaultdict, Counter
 
 
 class Node:
@@ -289,7 +288,7 @@ class MyTreeReg:
             self.print_tree(node.right, depth + 1)
 
 
-class MyBoostReg:
+class MyBoostClf:
     def __init__(
         self,
         n_estimators: int = 10,
@@ -298,7 +297,6 @@ class MyBoostReg:
         min_samples_split: int = 2,
         max_leafs: int = 20,
         bins: int = 16,
-        loss: str = "MSE",
         metric: Optional[str] = None,
         max_features: float = 0.5,
         max_samples: float = 0.5,
@@ -307,7 +305,11 @@ class MyBoostReg:
     ):
         self.n_estimators = n_estimators
         self.learning_rate = learning_rate
-        self.loss = loss
+
+        self.max_depth = max_depth
+        self.min_samples_split = min_samples_split
+        self.max_leafs = max_leafs
+        self.bins = bins
         self.metric = metric
 
         self.max_features = max_features
@@ -315,13 +317,8 @@ class MyBoostReg:
         self.random_state = random_state
         self.reg = reg
 
-        self.max_depth = max_depth
-        self.min_samples_split = min_samples_split
-        self.max_leafs = max_leafs
-        self.bins = bins
-
         self.pred_0 = 0
-        self.best_score = 0 if self.metric == "R2" else np.inf
+        self.best_score = 0 if self.metric is not None else np.inf
         self.trees = []
         self.fi = {}
 
@@ -332,11 +329,8 @@ class MyBoostReg:
 
     def _update_leafs(self, node: Union[Node, Leaf], X, y, preds):
         if isinstance(node, Leaf):
-            residual = y - preds
-            if self.loss == "MSE":
-                node.pred = np.mean(residual) + self.leafs_cnt * self.reg
-            elif self.loss == "MAE":
-                node.pred = np.median(residual) + self.leafs_cnt * self.reg
+            p = np.exp(preds) / (1 + np.exp(preds))
+            node.pred = np.sum(y - p) / np.sum(p * (1 - p)) + self.leafs_cnt * self.reg
         elif isinstance(node, Node):
             # left
             left_idx = X[node.col] <= node.val
@@ -347,34 +341,57 @@ class MyBoostReg:
             X_right, y_right, preds_right = X[right_idx], y[right_idx], preds[right_idx]
             self._update_leafs(node.right, X_right, y_right, preds_right)
 
-    def _calculate_scores(self, y_true, y_pred):
+    def _get_metrics(self, y, preds):
+        # calculate probs
+        probs = np.exp(preds) / (1 + np.exp(preds))
         # loss
-        loss = self._calculate_loss(y_true, y_pred)
+        loss = self._logloss(y, probs)
+
         # metric
+        y_hat = probs > 0.5
+        tp, fp, tn, fn = 0, 0, 0, 0
+        for label, pred in zip(y, y_hat):
+            if label == pred == 1:
+                tp += 1
+            elif label == pred == 0:
+                tn += 1
+            elif label == 1:
+                fn += 1
+            elif label == 0:
+                fp += 1
+
+        # metrics
         if self.metric is None:
             metric_val = loss
-        elif self.metric == "MAE":
-            metric_val = np.mean(np.abs(y_true - y_pred))
-        elif self.metric == "MSE":
-            metric_val = np.mean((y_pred - y_true) ** 2)
-        elif self.metric == "RMSE":
-            metric_val = np.mean((y_true - y_pred) ** 2)
-            metric_val = np.sqrt(metric_val)
-        elif self.metric == "MAPE":
-            metric_val = 100 * np.mean(np.abs((y_true - y_pred) / y))
-        elif self.metric == "R2":
-            metric_val = 1 - np.sum((y_true - y_pred) ** 2) / np.sum(
-                (y_true - y_true.mean()) ** 2
-            )
+        if self.metric == "accuracy":
+            metric_val = (tp + tn) / (tp + tn + fp + fn)
+        elif self.metric == "precision":
+            metric_val = tp / (tp + fp)
+        elif self.metric == "recall":
+            metric_val = tp / (tp + fn)
+        elif self.metric == "f1":
+            precision = tp / (tp + fp)
+            recall = tp / (tp + fn)
+            metric_val = 2 * (precision * recall) / (precision + recall)
+        elif self.metric == "roc_auc":
+            vals = list(zip(np.array(probs).round(10), y))
+            vals = sorted(vals, key=lambda x: x[0], reverse=True)
+            vals = np.array(vals)
+            probs, y = vals[:, 0], vals[:, 1]
+            roc_auc_score = 0
+            for prob, pred in vals:
+                if pred == 0:
+                    roc_auc_score += (
+                        np.sum(y[probs > prob]) + np.sum(y[probs == prob]) / 2
+                    )
+
+            pos_nums, neg_nums = sum(y), len(y) - sum(y)
+            metric_val = roc_auc_score / (pos_nums * neg_nums)
 
         return loss, metric_val
 
-    def _calculate_loss(self, y_true, y_pred):
-        if self.loss == "MSE":
-            loss = np.mean((y_pred - y_true) ** 2)
-        elif self.loss == "MAE":
-            loss = np.mean(np.abs(y_pred - y_true))
-        return loss
+    def _logloss(self, y, probs):
+        return -np.mean(y * np.log(probs) + (1 - y) * np.log(1 - probs))
 
     def fit(
         self,
@@ -386,19 +403,18 @@ class MyBoostReg:
         verbose: Optional[int] = None,
     ):
         random.seed(self.random_state)
-
         self.leafs_cnt = 0
-        no_improvements = 0
-        if self.loss == "MSE":
-            self.pred_0 = np.mean(y)
-        elif self.loss == "MAE":
-            self.pred_0 = np.median(y)
+        # get first pred
+        p = np.mean(y)
+        self.pred_0 = np.log(p / (1 - p))
         preds = pd.Series(np.full_like(y, self.pred_0, dtype=np.float64), index=y.index)
         if early_stopping:
+            no_improvements = 0
             preds_eval = pd.Series(
                 np.full_like(y_eval, self.pred_0, dtype=np.float64), index=y_eval.index
             )
 
+        # train
         for iter_num in range(1, self.n_estimators + 1):
             # sample
             cols_idx = random.sample(
@@ -411,12 +427,10 @@ class MyBoostReg:
             y_sample = y.loc[rows_idx].copy()
             preds_sample = preds.loc[rows_idx].copy()
 
-            # gradient
-            if self.loss == "MSE":
-                grad = 2 * (preds_sample - y_sample)
-            elif self.loss == "MAE":
-                grad = np.sign(preds_sample - y_sample)
+            # residual
+            grad = y_sample - np.exp(preds_sample) / (1 + np.exp(preds_sample))
 
+            # fit
             model = MyTreeReg(
                 self.max_depth,
                 self.min_samples_split,
@@ -424,45 +438,45 @@ class MyBoostReg:
                 self.bins,
                 examples_num=len(y),
             )
+            model.fit(X_sample, grad)
 
-            # fit
-            model.fit(X_sample, -grad)
             # update leafs
             self._update_leafs(model.tree, X_sample, y_sample, preds_sample)
             self.trees.append(model)
+
             # update preds
             new_preds = model.predict(X)
-            if callable(self.learning_rate):
-                lr_step = self.learning_rate(iter_num)
-            else:
-                lr_step = self.learning_rate
+            lr_step = (
+                self.learning_rate(iter_num)
+                if callable(self.learning_rate)
+                else self.learning_rate
+            )
             preds += np.asarray(new_preds) * lr_step
             self.leafs_cnt += model.leafs_cnt
 
-            # loss & metrics
             if early_stopping:
                 # get scores
                 model_eval_preds = model.predict(X_eval)
                 preds_eval += np.asarray(model_eval_preds, dtype=np.float64) * lr_step
-                loss, score = self._calculate_scores(y_eval, preds_eval)
-                if self.metric == "R2":
+                loss, score = self._get_metrics(y_eval, preds_eval)
+                # no improvements
+                if self.metric is not None:
                     no_improvements += score < self.best_score
                     self.best_score = max(self.best_score, score)
                 else:
                     no_improvements += score > self.best_score
                     self.best_score = min(self.best_score, score)
-
+                # stopping
                 if no_improvements == early_stopping:
                     self.trees = self.trees[:-early_stopping]
                     break
             else:
-                preds_sample = preds.loc[rows_idx].copy()
-                loss, score = self._calculate_scores(y_sample, preds_sample)
+                loss, score = self._get_metrics(y, preds)
                 self.best_score = score
 
             # verbose
             if verbose is not None and iter_num % verbose == 0:
-                print(f"{iter_num}. Loss[{self.loss}]: {loss} | {self.metric}: {score}")
+                print(f"{iter_num}. Loss: {loss} | Metric: {score}")
 
         # update fi
         for col in X.columns:
@@ -471,18 +485,24 @@ class MyBoostReg:
             for col in X.columns:
                 self.fi[col] += tree.fi.get(col, 0)
 
-    def predict(self, X: pd.DataFrame):
+    def predict_proba(self, X: pd.DataFrame):
         preds = []
         for iter_num, tree in enumerate(self.trees, start=1):
             pred = tree.predict(X)
             pred = np.asarray(pred)
-            if callable(self.learning_rate):
-                lr_step = self.learning_rate(iter_num)
-            else:
-                lr_step = self.learning_rate
+            lr_step = (
+                self.learning_rate(iter_num)
+                if callable(self.learning_rate)
+                else self.learning_rate
+            )
             preds.append(pred * lr_step)
 
         preds = np.asarray(preds).sum(axis=0)
         preds += self.pred_0
+        preds = np.exp(preds) / (1 + np.exp(preds))
 
         return preds
+
+    def predict(self, X: pd.DataFrame):
+        preds = self.predict_proba(X)
+        return preds > 0.5
